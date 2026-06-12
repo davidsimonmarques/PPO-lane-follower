@@ -48,8 +48,12 @@ class CarlaEnvironment:
         settings = self.world.get_settings()
         settings.synchronous_mode = self.config.get("synchronous", True)
         settings.fixed_delta_seconds = self.config.get("fixed_delta_seconds", 0.05)
-        settings.no_rendering_mode = self.config.get("no_rendering", False)
         self.world.apply_settings(settings)
+
+        # O modo 'no_rendering' é ativado se 'render' for False.
+        # Isso melhora drasticamente a performance durante o treinamento.
+        render_enabled = self.config.get("render", False)
+        settings.no_rendering_mode = not render_enabled
 
         # 🚀 OTIMIZAÇÃO: Limitação de FPS para reduzir carga de CPU
         if self.config.get("max_fps"):
@@ -57,9 +61,10 @@ class CarlaEnvironment:
             settings.max_substeps = 1
             self.world.apply_settings(settings)
 
+        self.world.apply_settings(settings)
         self._spawn_vehicle()
         self._setup_sensors()
-        if self.config.get("render", False):
+        if self.config.get("draw_waypoints", False):
             self._draw_waypoints()
 
     def _get_spawn_point(self) -> carla.Transform:

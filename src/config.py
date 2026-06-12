@@ -2,7 +2,7 @@ CONFIG = {
     # Conexão CARLA
     "host": "127.0.0.1",
     "port": 2000,
-    "map_name": "Town10HD", #"Town10HD", 
+    "map_name": "Town10HD_Opt", #"Town10HD", 
     "verbose": True,
     # Treino geral com Stable-Baselines3
     "total_episodes": 7000, # Alvo de episódios para treinar
@@ -33,17 +33,16 @@ CONFIG = {
     "action_high": [1.0, 1.0],
 
     # Recompensa / shaping
-    "lane_center_reward": 1.5,  # Renomeado de 'penalty'. Recompensa por centralização na pista.
-    "heading_penalty": 0.1,  # penaliza diferença de orientação; ajustar para reduzir curvas incorretas
-    "offroad_penalty": 50.0,  # penalidade forte por sair da pista (aplicada preferencialmente ao fim do episódio)
-    "success_reward": 50.0,  # bônus por completar a rota
+    "lane_center_reward": 4.0,  # Recompensa por centralização na pista.
+    "heading_penalty": 0.03,  # penaliza diferença de orientação; ajustar para reduzir curvas incorretas
+    "offroad_penalty": 200.0,  # penalidade forte por sair da pista (aplicada preferencialmente ao fim do episódio)
+    "success_reward": 300.0,  # bônus por completar a rota
     "max_speed_ref": 40/3.6,  # km/h / 3.6 = m/s; referência para recompensa de velocidade; 
-    "speed_reward": 0.2,  # recompensa máxima por velocidade (proporcional à velocidade atual)
+    "speed_reward": 0.15,  # recompensa máxima por velocidade (proporcional à velocidade atual)
     "success_distance": 2000,
 
     # Configurações de Câmera e Render
-    "render": True,
-    "no_rendering": False,  # Desativa renderização para melhor desempenho durante o treinamento
+    "render": False, 
     "camera_width": 800,
     "camera_height": 400,
     "camera_fov": 90,

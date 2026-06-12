@@ -42,11 +42,13 @@ class EvaluationConfig:
         self.max_fps = 30
         
         # Visualização
-        self.display_width = 1280
+        self.render = True # ESSENCIAL: Garante que o servidor CARLA renderize as imagens.
+        self.draw_waypoints = False # Desenha os waypoints do mapa na visão superior (pode ajudar a entender o trajeto)
+        self.display_width = 1280   
         self.display_height = 720
         
         # Modelo DDPG
-        self.model_path = "logs\\checkpoints\\ddpg_model_9100000_steps.zip" # AJUSTE PARA O SEU CHECKPOINT
+        self.model_path = "assets\\ddpg_model_0000_steps.zip" # AJUSTE PARA O SEU CHECKPOINT
         self.load_pretrained = True
         self.max_steps = 1000000
         self.success_distance = 2000
@@ -54,10 +56,13 @@ class EvaluationConfig:
         self.min_speed_threshold = 0.5
         
         # Gravação
-        self.record_pygame = False
-        self.record_carla = False
+        self.record_pygame = True
+        self.record_carla = True
         self.pygame_video_path = "evaluation_pygame.mp4"
         self.carla_rec_path = os.path.abspath("evaluation_carla.log").replace('\\', '/')
+        
+        # Desenho
+        self.draw_waypoints = False
 
     def to_dict(self):
         """Converte a configuração para um dicionário compatível com CarlaEnvironment."""
@@ -251,7 +256,7 @@ class HUD:
                 display.blit(surface, (8, v_offset))
             v_offset += 18
 
-def generate_map_images(world, trajectory, base_name="evaluation_result"):
+def generate_map_images(world, trajectory, draw_waypoints=False, base_name="evaluation_result"):
     """Gera e salva a visão superior do mapa e o trajeto percorrido."""
     try:
         print("\nGerando imagens do mapa. Aguarde...")
@@ -260,14 +265,20 @@ def generate_map_images(world, trajectory, base_name="evaluation_result"):
         if trajectory and len(trajectory) > 10:
             trajectory = trajectory[10:]
             
-        # Pegar waypoints para desenhar o mapa (espaçamento de 2.0 metros)
-        waypoints = world.get_map().generate_waypoints(2.0)
+        waypoints = []
+        if draw_waypoints:
+            # Pegar waypoints para desenhar o mapa (espaçamento de 2.0 metros)
+            waypoints = world.get_map().generate_waypoints(2.0)
         
         # Encontrar limites do mapa
-        min_x = min(wp.transform.location.x for wp in waypoints)
-        max_x = max(wp.transform.location.x for wp in waypoints)
-        min_y = min(wp.transform.location.y for wp in waypoints)
-        max_y = max(wp.transform.location.y for wp in waypoints)
+        min_x, max_x = float('inf'), float('-inf')
+        min_y, max_y = float('inf'), float('-inf')
+        
+        if waypoints:
+            min_x = min(wp.transform.location.x for wp in waypoints)
+            max_x = max(wp.transform.location.x for wp in waypoints)
+            min_y = min(wp.transform.location.y for wp in waypoints)
+            max_y = max(wp.transform.location.y for wp in waypoints)
         
         # Considerar também os limites da trajetória
         if trajectory:
@@ -275,6 +286,10 @@ def generate_map_images(world, trajectory, base_name="evaluation_result"):
             max_x = max(max_x, max(p[0] for p in trajectory))
             min_y = min(min_y, min(p[1] for p in trajectory))
             max_y = max(max_y, max(p[1] for p in trajectory))
+            
+        # Fallback caso não haja waypoints nem trajetória
+        if min_x == float('inf'):
+            min_x, max_x, min_y, max_y = -100.0, 100.0, -100.0, 100.0
             
         # Adicionar margem de respiro
         padding = 50.0
@@ -315,9 +330,10 @@ def generate_map_images(world, trajectory, base_name="evaluation_result"):
             cv2.putText(map_img, f"{y_m}m", (15, py - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
             
         # Desenhar ruas
-        for wp in waypoints:
-            px, py = to_pixel(wp.transform.location.x, wp.transform.location.y)
-            cv2.circle(map_img, (px, py), max(int(2 * scale), 1), (60, 60, 60), -1)
+        if draw_waypoints and waypoints:
+            for wp in waypoints:
+                px, py = to_pixel(wp.transform.location.x, wp.transform.location.y)
+                cv2.circle(map_img, (px, py), max(int(2 * scale), 1), (60, 60, 60), -1)
             
         # Salvar mapa base
         cv2.imwrite(f"{base_name}_map.png", map_img)
@@ -455,9 +471,11 @@ def main():
         pygame_video_writer = None # Inicializar aqui para garantir que esteja no escopo do finally
         if config.record_pygame:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            fps = 60.0 # Usar o FPS do clock para o vídeo
+            # O FPS do vídeo deve corresponder ao tempo real da simulação para não ficar acelerado.
+            # Se a simulação avança 'fixed_delta_seconds' por passo, o FPS é 1.0 / fixed_delta_seconds.
+            fps = 1.0 / config.fixed_delta_seconds if config.fixed_delta_seconds else 30.0
             pygame_video_writer = cv2.VideoWriter(config.pygame_video_path, fourcc, fps, (config.display_width, config.display_height))
-            print(f"Gravador Pygame iniciado. Salvando em: {config.pygame_video_path}")
+            print(f"Gravador Pygame iniciado. Salvando em: {config.pygame_video_path} a {fps} FPS")
 
         previous_location = observation["location"]
         steps = 0
@@ -486,7 +504,7 @@ def main():
             # Usar o modelo SB3 para prever a ação (determinística)
             action, _ = model.predict(state, deterministic=True)
             action = np.asarray(action, dtype=np.float32).flatten()
-            action = np.clip(action, [0.0, -1.0], [1.0, 1.0])
+            action = np.clip(action, [0.0, -1.0], [0.7, 1.0])
 
             # Forçar um throttle mínimo na saída do repouso, caso o modelo esteja produzindo valores muito baixos.
             if observation.get("speed", 0.0) < config.min_speed_threshold and action[0] < config.min_throttle:
@@ -573,7 +591,7 @@ def main():
         print(f"Sucesso: {'SIM' if distance_traveled >= config.success_distance else 'NÃO'}")
         
         # Gerar imagens de resumo final do trajeto
-        generate_map_images(world, trajectory)
+        generate_map_images(world, trajectory, draw_waypoints=config.draw_waypoints)
         
         # Manter tela visível por 3 segundos
         for _ in range(180):

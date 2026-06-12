@@ -48,11 +48,11 @@ class RewardFunction:
         # Penaliza esterçamento brusco do volante (assumindo que action[0] seja steering no range [-1, 1])
         # Ajuste o índice do array 'action' conforme o design do seu environment
         steering_action = abs(action[0]) 
-        steering_penalty_weight = 0.1
+        steering_penalty_weight = 0.06
         reward -= steering_penalty_weight * (steering_action ** 2) # Ao quadrado penaliza mais os extremos
         
         # (Opcional) Penalidade por step para incentivar o término rápido do percurso
-        # reward -= 0.05 
+        reward -= 0.05 
         
         return float(reward)
 
