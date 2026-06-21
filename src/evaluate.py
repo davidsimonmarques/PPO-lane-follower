@@ -21,9 +21,9 @@ logging.getLogger('pygame').setLevel(logging.CRITICAL)
 # Importar módulos do projeto
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import CONFIG
-# Importar o agente DDPG do Stable Baselines
+# Importar o agente PPO do Stable Baselines
 from environment.carla_env import CarlaEnvironment
-from stable_baselines3 import DDPG
+from stable_baselines3 import PPO
 
 
 class EvaluationConfig:
@@ -47,8 +47,8 @@ class EvaluationConfig:
         self.display_width = 1280   
         self.display_height = 720
         
-        # Modelo DDPG
-        self.model_path = "assets\\ddpg_model_0000_steps.zip" # AJUSTE PARA O SEU CHECKPOINT
+        # Modelo PPO
+        self.model_path = "src\\logs\\checkpoints\\ppo_model_4850000_steps.zip" # AJUSTE PARA O SEU CHECKPOINT
         self.load_pretrained = True
         self.max_steps = 1000000
         self.success_distance = 2000
@@ -56,8 +56,8 @@ class EvaluationConfig:
         self.min_speed_threshold = 0.5
         
         # Gravação
-        self.record_pygame = True
-        self.record_carla = True
+        self.record_pygame = False
+        self.record_carla = False
         self.pygame_video_path = "evaluation_pygame.mp4"
         self.carla_rec_path = os.path.abspath("evaluation_carla.log").replace('\\', '/')
         
@@ -214,9 +214,11 @@ class HUD:
             'Offroad: % 10s' % ("YES" if observation.get("offroad", False) else "NO"),
             'Throttle: % 7.3f' % control.throttle,
             'Steer:    % 7.3f' % control.steer,
+            'Brake:    % 7.3f' % control.brake,
             '',
             ('Throttle:', control.throttle, 0.0, 1.0),
-            ('Steer:', control.steer, -1.0, 1.0)
+            ('Steer:', control.steer, -1.0, 1.0),
+            ('Brake:', control.brake, 0.0, 1.0)
         ]
     
     def render(self, display):
@@ -438,7 +440,7 @@ def main():
     evaluation_logger = None
     
     try:
-        # Carregar modelo DDPG treinado
+        # Carregar modelo PPO treinado
         print(f"Carregando modelo de {config.model_path}...")
         if not os.path.exists(config.model_path):
             raise FileNotFoundError(f"Modelo não encontrado em {config.model_path}")
@@ -449,7 +451,7 @@ def main():
         print("Iniciando avaliação...")
         observation = env.reset()
         vehicle = env.vehicle # <--- ATUALIZE A REFERÊNCIA DO VEÍCULO AQUI!
-        model = DDPG.load(config.model_path)
+        model = PPO.load(config.model_path)
 
         # Criar câmera (AGORA, DEPOIS QUE 'vehicle' FOI DEFINIDO)
         print("Configurando câmeras...")
@@ -504,18 +506,26 @@ def main():
             # Usar o modelo SB3 para prever a ação (determinística)
             action, _ = model.predict(state, deterministic=True)
             action = np.asarray(action, dtype=np.float32).flatten()
-            action = np.clip(action, [0.0, -1.0], [0.7, 1.0])
+            # O clip deve corresponder ao novo espaço de ação: [throttle_brake, steer]
+            action = np.clip(action, [-1.0, -1.0], [1.0, 1.0])
 
-            # Forçar um throttle mínimo na saída do repouso, caso o modelo esteja produzindo valores muito baixos.
-            if observation.get("speed", 0.0) < config.min_speed_threshold and action[0] < config.min_throttle:
-                action[0] = config.min_throttle
-                print(f"[EVAL] Low speed fallback applied: throttle set to {action[0]:.3f}")
+            # Forçar uma aceleração mínima na saída do repouso, caso o modelo queira frear ou ficar parado.
+            # if observation.get("speed", 0.0) < config.min_speed_threshold and action[0] <= 0:
+            #     # Força uma pequena ação positiva para garantir o throttle mínimo de 0.2
+            #     action[0] = 0.1
+            #     print(f"[EVAL] Low speed fallback applied: action[0] set to {action[0]:.3f}")
 
             print(f"[EVAL] step={steps} speed={observation.get('speed',0.0):.3f} action={action}")
+            # Este objeto de controle é para logging. Ele deve simular a lógica de _apply_action.
             control = carla.VehicleControl()
-            control.throttle = float(action[0])
+            action_throttle_brake = float(action[0])
             control.steer = float(action[1])
-            control.brake = 0.0
+            if action_throttle_brake > 0:
+                control.throttle = action_throttle_brake
+                control.brake = 0.0
+            else:
+                control.throttle = 0.0
+                control.brake = abs(action_throttle_brake)
 
             # Avançar um passo na simulação e obter novos dados
             observation, _, done, info = env.step(action)

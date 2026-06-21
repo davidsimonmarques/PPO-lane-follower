@@ -6,106 +6,93 @@ import os
 
 from environment.gym_wrapper import CarlaGymWrapper
 from utils.logger import setup_logger
-from training.callbacks import SuccessRateCallback, EpisodeCountCallback, ActionNoiseDecayCallback, EpisodeMetricsCallback # Importar os callbacks
-from stable_baselines3 import DDPG
-from stable_baselines3.common.noise import NormalActionNoise, OrnsteinUhlenbeckActionNoise
+from training.callbacks import EpisodeCountCallback, EpisodeMetricsCallback, SuccessRateCallback
+from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
+from stable_baselines3.common.vec_env import DummyVecEnv
 
 
 def train(config: Dict) -> None:
     logger = setup_logger(config)
-    env = None  # Inicializar env como None para o bloco finally
+    env = None
+
+    # Caminhos absolutos baseados na raiz do projeto
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _tb_log = os.path.join(_project_root, 'logs', 'tensorboard')
+    _ckpt_log = os.path.join(_project_root, 'logs', 'checkpoints')
 
     try:
-        # 1. Criar o ambiente com o nosso wrapper
+        # Garantir que os diretórios de logs existem
+        os.makedirs(_tb_log, exist_ok=True)
+        os.makedirs(_ckpt_log, exist_ok=True)
+        logger.info(f"TensorBoard log: {_tb_log}")
+
+        # 1. Criar o ambiente
         logger.info("Criando ambiente CarlaGymWrapper...")
         env = CarlaGymWrapper(config)
+        vec_env = DummyVecEnv([lambda: env])
         logger.info("Ambiente criado com sucesso.")
 
-
-        # 2. Configurar o ruído para exploração do DDPG
-        n_actions = env.action_space.shape[-1]
-        action_noise = NormalActionNoise(
-            mean=np.zeros(n_actions), 
-            sigma=config.get("noise_initial_sigma", 0.1) * np.ones(n_actions)
-        )
-
-        # Callback para salvar checkpoints
+        # Callbacks
         checkpoint_callback = CheckpointCallback(
-          save_freq=10000,  # Salva a cada 10.000 passos
-          save_path='./logs/checkpoints/',
-          name_prefix='ddpg_model',
-          save_replay_buffer=True,
-          save_vecnormalize=True,
+            save_freq=10000,
+            save_path=_ckpt_log,
+            name_prefix='ppo_model',
+            save_replay_buffer=False,
+            save_vecnormalize=True,
         )
-
-        # Callback para logar a taxa de sucesso (janela de 100 episódios)
-        success_callback = SuccessRateCallback(check_freq=1, window_size=100)
-
-        # Callback para parar o treinamento com base no número de episódios
+        success_callback = SuccessRateCallback(window_size=100)
         episode_callback = EpisodeCountCallback(target_episodes=config.get("total_episodes", 1000), verbose=1)
-
-        # Callback para decair o ruído de exploração
-        noise_decay_callback = ActionNoiseDecayCallback(
-            initial_sigma=config.get("noise_initial_sigma", 0.3),
-            final_sigma=config.get("noise_final_sigma", 0.01),
-            decay_end_step=config.get("noise_decay_end_step", 500000)
-        )
-
-        # Callback para gravar métricas de episódio no TensorBoard
         episode_metrics_callback = EpisodeMetricsCallback(verbose=1)
 
-        # Combinar os callbacks em uma lista para passar ao `learn`
         callback_list = CallbackList([
             checkpoint_callback,
             success_callback,
             episode_callback,
             episode_metrics_callback,
-            noise_decay_callback
         ])
 
-        # 3. Instanciar ou carregar o agente DDPG
+        # 2. Instanciar ou carregar o agente PPO
         model_path = config.get("model_path")
         if config.get("load_pretrained") and model_path and os.path.exists(model_path):
             logger.info(f"Carregando modelo pré-treinado de: {model_path}")
-            model = DDPG.load(
-                model_path,
-                env=env, # Passar o ambiente para continuar o treinamento
-                tensorboard_log="./logs/tensorboard/"
-            )
-            # O replay buffer é carregado automaticamente se foi salvo com o modelo
-            logger.info("Modelo e replay buffer carregados.")
+            model = PPO.load(model_path, env=vec_env, tensorboard_log=_tb_log)
+            logger.info("Modelo carregado.")
         else:
-            logger.info("Criando um novo modelo DDPG.")
-            model = DDPG(
+            logger.info("Criando um novo modelo PPO.")
+            model = PPO(
                 "MlpPolicy",
-                env,
-                action_noise=action_noise,
+                vec_env,
                 gamma=config.get("gamma"),
-                tau=config.get("tau"),
-                learning_rate=config.get("actor_lr"), # SB3 usa um único learning_rate
-                buffer_size=config.get("buffer_size"),
-                batch_size=config.get("batch_size"),
+                learning_rate=config.get("actor_lr"),
+                n_steps=config.get("n_steps", 2048),
+                batch_size=config.get("batch_size", 64),
+                n_epochs=config.get("n_epochs", 10),
+                clip_range=config.get("clip_range", 0.2),
+                ent_coef=config.get("ent_coef", 0.01),
+                gae_lambda=config.get("gae_lambda", 0.95),
+                vf_coef=config.get("vf_coef", 0.5),
+                max_grad_norm=config.get("max_grad_norm", 0.5),
                 verbose=1,
-                tensorboard_log="./logs/tensorboard/"
+                tensorboard_log=_tb_log,
             )
 
-        # 4. Treinar o modelo
-        logger.info("Iniciando o treinamento do modelo DDPG...")
+        # 3. Treinar
+        logger.info("Iniciando o treinamento do modelo PPO...")
         model.learn(
-            total_timesteps=config.get("total_timesteps", 1000000), # Deixamos um valor alto, o callback irá parar
-            callback=callback_list  # Adiciona a lista de callbacks
+            total_timesteps=config.get("total_timesteps", 1000000),
+            callback=callback_list
         )
 
-        # 5. Salvar o modelo final
-        model.save(config.get("model_path", "assets/ddpg_lane_follower"))
+        # 4. Salvar o modelo final
+        model.save(config.get("model_path", "assets/ppo_lane_follower"))
         logger.info(f"Modelo salvo em: {config.get('model_path')}")
 
     except KeyboardInterrupt:
         logger.info("Treinamento interrompido pelo usuário (Ctrl+C).")
     except Exception as e:
         logger.error(f"Erro crítico durante o treinamento: {e}")
-        raise e # Re-levanta o erro para debug após a limpeza
+        raise e
     finally:
         if env is not None:
             logger.info("Encerrando o ambiente CARLA...")

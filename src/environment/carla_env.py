@@ -1,13 +1,14 @@
-"""Wrapper de ambiente CARLA para lane follower."""
+"""Wrapper de ambiente CARLA para lane follower.
+Otimizado para máxima performance durante treinamento."""
 
 import random
-import time
 from typing import Any, Dict, Optional, Tuple
 
 import carla
 import numpy as np
 
 import cv2
+
 
 class CarlaEnvironment:
     def __init__(self, config: Dict):
@@ -25,8 +26,17 @@ class CarlaEnvironment:
         self.spectator: Optional[carla.Actor] = None
         self.driver_image: Optional[np.ndarray] = None
         self.collision_detected = False
-        self.distance_traveled = 0.0  # Distância percorrida em metros
+        self.distance_traveled = 0.0
         self.previous_location: Optional[carla.Location] = None
+
+        # Detecção de "preso"
+        self.stuck_timer = 0.0
+        self.stuck_speed_threshold = float(self.config.get("stuck_speed_threshold", 0.1))
+        self.stuck_time_threshold = float(self.config.get("stuck_time_threshold", 5.0))
+
+        # Flag de rendering (evita lookup repetido)
+        self._no_rendering = self.config.get("no_rendering_mode", not self.config.get("render", False))
+
         self._setup_environment()
 
     def _setup_environment(self) -> None:
@@ -45,33 +55,23 @@ class CarlaEnvironment:
         self.map = self.world.get_map()
         self.blueprint_library = self.world.get_blueprint_library()
 
+        # Configurar tudo de uma vez
         settings = self.world.get_settings()
         settings.synchronous_mode = self.config.get("synchronous", True)
         settings.fixed_delta_seconds = self.config.get("fixed_delta_seconds", 0.05)
-        self.world.apply_settings(settings)
+        settings.no_rendering_mode = self._no_rendering
 
-        # O modo 'no_rendering' é ativado se 'render' for False.
-        # Isso melhora drasticamente a performance durante o treinamento.
-        render_enabled = self.config.get("render", False)
-        settings.no_rendering_mode = not render_enabled
-
-        # 🚀 OTIMIZAÇÃO: Limitação de FPS para reduzir carga de CPU
         if self.config.get("max_fps"):
             settings.max_substep_delta_time = 1.0 / self.config["max_fps"]
             settings.max_substeps = 1
-            self.world.apply_settings(settings)
 
         self.world.apply_settings(settings)
+
         self._spawn_vehicle()
         self._setup_sensors()
+
         if self.config.get("draw_waypoints", False):
             self._draw_waypoints()
-
-    def _get_spawn_point(self) -> carla.Transform:
-        spawn_points = self.map.get_spawn_points()
-        if not spawn_points:
-            raise RuntimeError("Nenhum ponto de spawn disponível no mapa CARLA.")
-        return random.choice(spawn_points)
 
     def _spawn_vehicle(self) -> None:
         self._destroy_sensors()
@@ -86,7 +86,6 @@ class CarlaEnvironment:
         if blueprint.has_attribute("role_name"):
             blueprint.set_attribute("role_name", "hero")
 
-        # Try multiple spawn points if collision occurs
         spawn_points = self.map.get_spawn_points()
         random.shuffle(spawn_points)
 
@@ -110,55 +109,64 @@ class CarlaEnvironment:
         self.collision_detected = False
         self.distance_traveled = 0.0
         self.previous_location = None
+        self.stuck_timer = 0.0
 
-        # 🚀 OTIMIZAÇÃO: Remover sleep desnecessário em modo assíncrono
         if self.config.get("synchronous", True):
             if self.world is not None:
                 self.world.tick()
-        # else: No sleep needed in async mode for faster training
 
-        self._update_spectator()
+        if not self._no_rendering:
+            self._update_spectator()
+
         return self._get_observation()
 
-    def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
+    def step(self, action: Any) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """Executa a ação e retorna (observação, recompensa, done, info)."""
         self._apply_action(action)
 
-        # 🚀 OTIMIZAÇÃO: Remover sleep desnecessário em modo assíncrono
         if self.config.get("synchronous", True):
             if self.world is not None:
                 self.world.tick()
-        # else: No sleep needed in async mode for faster training
 
         observation = self._get_observation()
 
-        # 🚀 OTIMIZAÇÃO: Cálculo de distância mais eficiente
+        # Detecção de "preso"
+        is_stuck = False
+        if observation["speed"] < self.stuck_speed_threshold:
+            self.stuck_timer += self.config.get("fixed_delta_seconds", 0.05)
+            if self.stuck_timer > self.stuck_time_threshold:
+                is_stuck = True
+        else:
+            self.stuck_timer = 0.0
+
+        # Cálculo de distância eficiente
         current_location = observation["location"]
         if self.previous_location is not None:
-            # Calcular apenas diferença horizontal (x,y) para performance
             dx = current_location.x - self.previous_location.x
             dy = current_location.y - self.previous_location.y
-            distance = (dx * dx + dy * dy) ** 0.5  # Evitar np.linalg.norm
+            distance = (dx * dx + dy * dy) ** 0.5
             self.distance_traveled += distance
         self.previous_location = current_location
 
         reward = 0.0
 
-        # Centralizar a lógica de término do episódio
         lane_offset_val = float(observation.get("lane_offset", 0.0))
         is_offroad = observation.get("offroad", False) or abs(lane_offset_val) > self.max_lane_offset
-        done = self.collision_detected or is_offroad
+        done = self.collision_detected or is_offroad or is_stuck
 
         success_distance = self.config.get("success_distance", 2000)
         reached_success_distance = (self.distance_traveled >= success_distance)
         done = done or reached_success_distance
 
-        # Determine human-readable termination reason
+        observation["stuck"] = is_stuck
+
         termination_reason: Optional[str] = None
         if self.collision_detected:
             termination_reason = "collision"
         elif is_offroad:
             termination_reason = f"offroad (lane_offset={lane_offset_val:.2f}m)"
+        elif is_stuck:
+            termination_reason = "stuck"
         elif reached_success_distance:
             termination_reason = f"success_distance_reached ({self.distance_traveled:.2f}m)"
 
@@ -167,41 +175,55 @@ class CarlaEnvironment:
             "distance_traveled": self.distance_traveled,
             "success": reached_success_distance,
             "termination_reason": termination_reason,
+            "stuck": is_stuck,
         }
 
         if done and self.verbose:
             print(f"[CarlaEnvironment] Episode finished: {termination_reason}")
-        self._update_spectator()
+
+        # Pular spectator update em modo no_rendering (treinamento)
+        if not self._no_rendering:
+            self._update_spectator()
+
         return observation, reward, done, info
 
     def _apply_action(self, action) -> None:
         control = carla.VehicleControl()
-        if isinstance(action, (list, tuple, np.ndarray)):
-            throttle = float(action[0]) if len(action) > 0 else 0.0
-            steer = float(action[1]) if len(action) > 1 else 0.0
-        else:
-            throttle = float(action)
-            steer = 0.0
 
-        throttle = max(0.0, min(1.0, throttle))
-        steer = max(-1.0, min(1.0, steer))
-        control.throttle = throttle
-        control.steer = steer
-        control.brake = 0.0
+        if not isinstance(action, (list, tuple, np.ndarray)) or len(action) < 2:
+            control.throttle = 0.0
+            control.steer = 0.0
+            control.brake = 1.0
+            self.vehicle.apply_control(control)
+            return
+
+        action_throttle_brake = float(action[0])
+        steer = float(action[1])
+
+        control.steer = max(-1.0, min(1.0, steer))
+
+        if action_throttle_brake > 0:
+            control.throttle = 0.2 + action_throttle_brake * (1.0 - 0.2)
+            control.brake = 0.0
+        else:
+            control.throttle = 0.0
+            control.brake = abs(action_throttle_brake)
+
         self.vehicle.apply_control(control)
 
     def _get_observation(self) -> Dict[str, Any]:
         transform = self.vehicle.get_transform()
         velocity = self.vehicle.get_velocity()
-        # 🚀 OTIMIZAÇÃO: Cálculo de velocidade mais eficiente (evitar np.linalg.norm)
         speed = (velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z) ** 0.5
 
         waypoint = self.map.get_waypoint(transform.location)
 
         lane_offset = self._compute_lane_offset(transform.location, waypoint)
-        heading_error = self._compute_heading_error(transform.rotation.yaw, waypoint.transform.rotation.yaw if waypoint else transform.rotation.yaw)
+        heading_error = self._compute_heading_error(
+            transform.rotation.yaw,
+            waypoint.transform.rotation.yaw if waypoint else transform.rotation.yaw
+        )
 
-        # Armazenar velocidade atual para renderização
         self.current_speed = speed
 
         return {
@@ -210,12 +232,12 @@ class CarlaEnvironment:
             "lane_offset": lane_offset,
             "heading_error": heading_error,
             "offroad": waypoint is None,
+            "stuck": False,
         }
 
     def _compute_lane_offset(self, location: carla.Location, waypoint: carla.Waypoint) -> float:
         if waypoint is None:
-            return 2.0  # Retornar um offset grande para indicar que está fora da pista
-
+            return 2.0
         dx = location.x - waypoint.transform.location.x
         dy = location.y - waypoint.transform.location.y
         yaw = np.deg2rad(waypoint.transform.rotation.yaw)
@@ -227,9 +249,8 @@ class CarlaEnvironment:
         return float(error)
 
     def _setup_sensors(self) -> None:
-        # 🚀 OTIMIZAÇÃO: Pular configuração de câmera se desabilitada
+        # Pular câmera completamente para performance máxima
         if self.config.get("disable_camera", False):
-            # Pular câmera completamente para performance máxima
             self.camera = None
             self.driver_image = None
         elif self.camera is None:
@@ -237,24 +258,28 @@ class CarlaEnvironment:
             camera_bp.set_attribute("image_size_x", str(self.config.get("camera_width", 800)))
             camera_bp.set_attribute("image_size_y", str(self.config.get("camera_height", 400)))
             camera_bp.set_attribute("fov", str(self.config.get("camera_fov", 90)))
-
-            camera_transform = carla.Transform(carla.Location(x=self.config.get("camera_x", 1.5), z=self.config.get("camera_z", 1.4)))
+            camera_transform = carla.Transform(
+                carla.Location(x=self.config.get("camera_x", 1.5), z=self.config.get("camera_z", 1.4))
+            )
             self.camera = self.world.spawn_actor(camera_bp, camera_transform, attach_to=self.vehicle)
             self.camera.listen(self._camera_callback)
 
-        # Sensor de colisão (sempre necessário para detectar fim de episódio)
+        # Sensor de colisão (sempre necessário)
         if self.collision_sensor is None:
             collision_bp = self.blueprint_library.find("sensor.other.collision")
             self.collision_sensor = self.world.spawn_actor(collision_bp, carla.Transform(), attach_to=self.vehicle)
             self.collision_sensor.listen(self._collision_callback)
 
-        self.spectator = self.world.get_spectator()
-        self._update_spectator()
+        # Pular spectator em modo no_rendering (treinamento)
+        if not self._no_rendering:
+            self.spectator = self.world.get_spectator()
+            self._update_spectator()
+        else:
+            self.spectator = None
 
     def _draw_waypoints(self) -> None:
         if self.world is None or self.map is None or self.waypoints_drawn:
             return
-
         distance = float(self.config.get("waypoint_draw_distance", 2.0))
         waypoints = self.map.generate_waypoints(distance=distance)
         debug = self.world.debug
@@ -271,22 +296,15 @@ class CarlaEnvironment:
         if actor is None:
             return
         try:
-            # CORREÇÃO: is_alive é um atributo, não uma função
             if hasattr(actor, 'is_alive') and not actor.is_alive:
                 return
-                
             actor.destroy()
-            
-            # Em modo síncrono, precisamos de um tick para o servidor 
-            # processar a remoção antes de tentarmos spawnar outro.
             if self.config.get("synchronous", True) and self.world is not None:
                 self.world.tick()
-        except Exception as e:
-            pass 
-            # print(f"Erro ao destruir ator: {e}")
+        except Exception:
+            pass
 
     def _destroy_sensors(self) -> None:
-        """Destrói sensores associados à instância."""
         if self.camera is not None:
             try:
                 self.camera.stop()
@@ -296,7 +314,7 @@ class CarlaEnvironment:
             finally:
                 self.camera = None
                 self.driver_image = None
-        
+
         if self.collision_sensor is not None:
             try:
                 self.collision_sensor.stop()
@@ -307,32 +325,23 @@ class CarlaEnvironment:
                 self.collision_sensor = None
 
     def _cleanup_previous_hero_vehicles(self) -> None:
-        """Limpa veículos de episódios anteriores e sensores órfãos."""
         if self.world is None:
             return
-
         try:
-            # 1. Primeiro, destrói todos os veículos antigos (exceto self.vehicle)
-            # Isso destroirá seus sensores acoplados automaticamente
             vehicles = self.world.get_actors().filter('vehicle.*')
             for actor in vehicles:
                 try:
-                    # Pula o veículo atual
                     if self.vehicle and actor.id == self.vehicle.id:
                         continue
-                    # Destrói qualquer outro veículo
                     self._safe_destroy(actor)
                 except Exception:
                     pass
 
-            # 2. Depois, limpar qualquer sensor órfão que possa ter restado
             sensors = self.world.get_actors().filter('sensor.*')
             for sensor in sensors:
                 try:
-                    # Skip sensores do veículo atual
                     if self.vehicle and sensor.parent and sensor.parent.id == self.vehicle.id:
                         continue
-                    # Destruir sensor órfão (sem veículo pai ou com veículo destruído)
                     self._safe_destroy(sensor)
                 except Exception:
                     pass
@@ -340,28 +349,22 @@ class CarlaEnvironment:
             pass
 
     def _hard_cleanup(self) -> None:
-        """Limpeza abrangente: destrói todos os veículos e sensores. Usado como fallback."""
         if self.world is None:
             return
-        
         try:
             actors = self.world.get_actors()
-            
-            # Destrói todos os veículos
             for actor in actors.filter('vehicle.*'):
                 try:
                     self._safe_destroy(actor)
-                except Exception as e:
-                    print(f"Erro ao destruir veículo {actor.id}: {e}")
-            
-            # Destrói todos os sensores
+                except Exception:
+                    pass
             for actor in actors.filter('sensor.*'):
                 try:
                     self._safe_destroy(actor)
-                except Exception as e:
-                    print(f"Erro ao destruir sensor {actor.id}: {e}")
-        except Exception as e:
-            print(f"Erro geral em _hard_cleanup: {e}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _camera_callback(self, image: carla.Image) -> None:
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
@@ -376,34 +379,23 @@ class CarlaEnvironment:
     def _update_spectator(self) -> None:
         if self.vehicle is None or self.spectator is None:
             return
-
         transform = self.vehicle.get_transform()
         position = transform.location + carla.Location(z=self.config.get("top_down_height", 40.0))
         rotation = carla.Rotation(pitch=self.config.get("top_down_pitch", -90.0), yaw=0.0)
         self.spectator.set_transform(carla.Transform(position, rotation))
 
     def render(self) -> None:
-        # 🚀 OTIMIZAÇÃO: Pular renderização completamente se câmera desabilitada
         if self.config.get("disable_camera", False) or not self.config.get("render", False):
             return
-
         if self.driver_image is not None and cv2 is not None:
-            # Copiar a imagem para adicionar texto
             display_image = self.driver_image.copy()
-
             try:
-                vehicle_id = self.vehicle.id if self.vehicle else "N/A"
-                vehicle_type = self.vehicle.type_id if self.vehicle else "N/A"
                 speed = f"{getattr(self, 'current_speed', 0.0) * 3.6:.2f} km/h"
                 distance = f"{self.distance_traveled:.2f} m"
-
-                cv2.putText(display_image, f"ID: {vehicle_id}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(display_image, f"Type: {vehicle_type}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(display_image, f"Speed: {speed}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(display_image, f"Distance: {distance}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            except Exception as e:
-                print(f"Erro ao adicionar texto na imagem: {e}")
-
+                cv2.putText(display_image, f"Speed: {speed}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(display_image, f"Distance: {distance}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            except Exception:
+                pass
             cv2.imshow("CARLA Driver View", display_image)
             cv2.waitKey(1)
 
@@ -413,15 +405,11 @@ class CarlaEnvironment:
         if self.vehicle is not None:
             self._safe_destroy(self.vehicle)
             self.vehicle = None
-
         if self.world is not None:
-            # Limpeza abrangente como fallback para remover atores órfãos
             self._hard_cleanup()
-            
             settings = self.world.get_settings()
             settings.synchronous_mode = False
             settings.fixed_delta_seconds = None
             self.world.apply_settings(settings)
-
         if cv2 is not None:
             cv2.destroyAllWindows()

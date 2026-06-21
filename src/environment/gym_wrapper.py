@@ -61,7 +61,7 @@ class CarlaGymWrapper(gym.Env):
         # O wrapper apenas passa os valores adiante.
         observation, _, done, info = self.env.step(action)
 
-        reward = self.reward_fn.compute(observation, action, done)
+        reward = self.reward_fn.compute(observation, action, done, info)
         state = self._to_state(observation)
 
         # Expor métricas úteis para callbacks / TensorBoard
@@ -70,11 +70,13 @@ class CarlaGymWrapper(gym.Env):
             "speed": float(observation.get("speed", 0.0)),
             "success": bool(info.get("success", False)),
             "distance_traveled": float(info.get("distance_traveled", 0.0)),
+            "lane_offset": float(observation.get("lane_offset", 0.0)),
+            "heading_error": float(observation.get("heading_error", 0.0)),
         })
 
         # A API do Gymnasium retorna `terminated` e `truncated`
         terminated = done
-        truncated = info.get("max_steps_reached", False) # Adicionar isso se tiver limite de passos
+        truncated = info.get("max_steps_reached", False)
 
         return state, reward, terminated, truncated, info
 
@@ -82,7 +84,7 @@ class CarlaGymWrapper(gym.Env):
         super().reset(seed=seed)
         observation = self.env.reset()
         state = self._to_state(observation)
-        info = {} # info é retornado no reset também
+        info = {}
         return state, info
 
     def render(self, mode='human'):
