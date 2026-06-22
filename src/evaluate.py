@@ -37,18 +37,19 @@ class EvaluationConfig:
         
         # Otimização de Performance
         self.synchronous = True
-        self.fixed_delta_seconds = 0.05
+        self.fixed_delta_seconds = 0.01
         self.disable_camera = False
-        self.max_fps = 30
+        self.max_fps = 60
         
         # Visualização
-        self.render = True # ESSENCIAL: Garante que o servidor CARLA renderize as imagens.
+        self.render = True
         self.draw_waypoints = False # Desenha os waypoints do mapa na visão superior (pode ajudar a entender o trajeto)
         self.display_width = 1280   
         self.display_height = 720
         
         # Modelo PPO
-        self.model_path = "src\\logs\\checkpoints\\ppo_model_4850000_steps.zip" # AJUSTE PARA O SEU CHECKPOINT
+        #self.model_path = "assets\\ppo_model_6020000_steps.zip" # AJUSTE PARA O SEU CHECKPOINT
+        self.model_path = "src\\logs\\checkpoints\\ppo_model_5270000_steps.zip"
         self.load_pretrained = True
         self.max_steps = 1000000
         self.success_distance = 2000
@@ -507,7 +508,7 @@ def main():
             action, _ = model.predict(state, deterministic=True)
             action = np.asarray(action, dtype=np.float32).flatten()
             # O clip deve corresponder ao novo espaço de ação: [throttle_brake, steer]
-            action = np.clip(action, [-1.0, -1.0], [1.0, 1.0])
+            action = np.clip(action, [-1.0, -1.0], [0.6, 1.0])
 
             # Forçar uma aceleração mínima na saída do repouso, caso o modelo queira frear ou ficar parado.
             # if observation.get("speed", 0.0) < config.min_speed_threshold and action[0] <= 0:

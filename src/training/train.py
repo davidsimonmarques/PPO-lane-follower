@@ -73,6 +73,7 @@ def train(config: Dict) -> None:
                 gae_lambda=config.get("gae_lambda", 0.95),
                 vf_coef=config.get("vf_coef", 0.5),
                 max_grad_norm=config.get("max_grad_norm", 0.5),
+                policy_kwargs=dict(net_arch=config.get("policy_net_arch", [128, 128])),
                 verbose=1,
                 tensorboard_log=_tb_log,
             )

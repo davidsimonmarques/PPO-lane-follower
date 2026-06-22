@@ -76,7 +76,7 @@ class CarlaEnvironment:
     def _spawn_vehicle(self) -> None:
         self._destroy_sensors()
         if self.vehicle is not None:
-            self._safe_destroy(self.vehicle)
+            self._batch_destroy([self.vehicle])
             self.vehicle = None
 
         self._cleanup_previous_hero_vehicles()
@@ -293,78 +293,87 @@ class CarlaEnvironment:
         self.waypoints_drawn = True
 
     def _safe_destroy(self, actor: Optional[carla.Actor]) -> None:
+        """Destroi um actor individual SEM world.tick() — tick será feito em batch."""
         if actor is None:
             return
         try:
             if hasattr(actor, 'is_alive') and not actor.is_alive:
                 return
             actor.destroy()
-            if self.config.get("synchronous", True) and self.world is not None:
-                self.world.tick()
         except Exception:
             pass
 
+    def _batch_destroy(self, actors: list) -> None:
+        """Destroi uma lista de actors de uma vez e chama 1 único world.tick() no final."""
+        for actor in actors:
+            if actor is None:
+                continue
+            try:
+                if hasattr(actor, 'is_alive') and not actor.is_alive:
+                    continue
+                actor.destroy()
+            except Exception:
+                pass
+        if self.config.get("synchronous", True) and self.world is not None:
+            try:
+                self.world.tick()
+            except Exception:
+                pass
+
     def _destroy_sensors(self) -> None:
+        """Destroi camera e collision sensor em batch (1 tick)."""
+        actors = []
         if self.camera is not None:
             try:
                 self.camera.stop()
-                self._safe_destroy(self.camera)
             except Exception:
                 pass
-            finally:
-                self.camera = None
-                self.driver_image = None
+            actors.append(self.camera)
+            self.camera = None
+            self.driver_image = None
 
         if self.collision_sensor is not None:
             try:
                 self.collision_sensor.stop()
-                self._safe_destroy(self.collision_sensor)
             except Exception:
                 pass
-            finally:
-                self.collision_sensor = None
+            actors.append(self.collision_sensor)
+            self.collision_sensor = None
+
+        self._batch_destroy(actors)
 
     def _cleanup_previous_hero_vehicles(self) -> None:
+        """Limpa veículos e sensores órfãos com batch destroy (1 tick)."""
         if self.world is None:
             return
+        actors_to_destroy = []
         try:
-            vehicles = self.world.get_actors().filter('vehicle.*')
-            for actor in vehicles:
-                try:
-                    if self.vehicle and actor.id == self.vehicle.id:
-                        continue
-                    self._safe_destroy(actor)
-                except Exception:
-                    pass
-
-            sensors = self.world.get_actors().filter('sensor.*')
-            for sensor in sensors:
-                try:
-                    if self.vehicle and sensor.parent and sensor.parent.id == self.vehicle.id:
-                        continue
-                    self._safe_destroy(sensor)
-                except Exception:
-                    pass
+            my_id = self.vehicle.id if self.vehicle else -1
+            for actor in self.world.get_actors().filter('vehicle.*'):
+                if actor.id != my_id:
+                    actors_to_destroy.append(actor)
+            for sensor in self.world.get_actors().filter('sensor.*'):
+                if sensor.parent is None or sensor.parent.id != my_id:
+                    actors_to_destroy.append(sensor)
         except Exception:
             pass
+        if actors_to_destroy:
+            self._batch_destroy(actors_to_destroy)
 
     def _hard_cleanup(self) -> None:
+        """Limpa todos os actors com batch destroy (1 tick)."""
         if self.world is None:
             return
+        actors_to_destroy = []
         try:
-            actors = self.world.get_actors()
-            for actor in actors.filter('vehicle.*'):
-                try:
-                    self._safe_destroy(actor)
-                except Exception:
-                    pass
-            for actor in actors.filter('sensor.*'):
-                try:
-                    self._safe_destroy(actor)
-                except Exception:
-                    pass
+            for actor in self.world.get_actors().filter('vehicle.*'):
+                actors_to_destroy.append(actor)
+            for actor in self.world.get_actors().filter('sensor.*'):
+                actors_to_destroy.append(actor)
         except Exception:
             pass
+        if actors_to_destroy:
+            self._batch_destroy(actors_to_destroy)
 
     def _camera_callback(self, image: carla.Image) -> None:
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
@@ -403,7 +412,7 @@ class CarlaEnvironment:
         """Libera recursos do CARLA."""
         self._destroy_sensors()
         if self.vehicle is not None:
-            self._safe_destroy(self.vehicle)
+            self._batch_destroy([self.vehicle])
             self.vehicle = None
         if self.world is not None:
             self._hard_cleanup()
