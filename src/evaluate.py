@@ -48,17 +48,15 @@ class EvaluationConfig:
         self.display_height = 720
         
         # Modelo PPO
-        #self.model_path = "assets\\ppo_model_6020000_steps.zip" # AJUSTE PARA O SEU CHECKPOINT
-        self.model_path = "src\\logs\\checkpoints\\ppo_model_5270000_steps.zip"
+        self.model_path = "assets\\ppo_model_6790000_steps_Final.zip"
+        #self.model_path = "src\\logs\\checkpoints\\ppo_model_5270000_steps.zip"
         self.load_pretrained = True
         self.max_steps = 1000000
         self.success_distance = 2000
-        self.min_throttle = 0.15
-        self.min_speed_threshold = 0.5
         
         # Gravação
-        self.record_pygame = False
-        self.record_carla = False
+        self.record_pygame = True
+        self.record_carla = True
         self.pygame_video_path = "evaluation_pygame.mp4"
         self.carla_rec_path = os.path.abspath("evaluation_carla.log").replace('\\', '/')
         
@@ -440,6 +438,10 @@ def main():
 
     evaluation_logger = None
     
+    # Diretório temporário para frames do vídeo
+    video_frames_dir = None
+    frame_count = 0
+    
     try:
         # Carregar modelo PPO treinado
         print(f"Carregando modelo de {config.model_path}...")
@@ -470,23 +472,23 @@ def main():
         # Criar HUD (AGORA, DEPOIS QUE 'vehicle' FOI DEFINIDO)
         hud = HUD(config.display_width, config.display_height)
         
-        # Iniciar gravador de vídeo Pygame (salva um .mp4)
-        pygame_video_writer = None # Inicializar aqui para garantir que esteja no escopo do finally
+        # Criar diretório temporário para frames do vídeo
         if config.record_pygame:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            # O FPS do vídeo deve corresponder ao tempo real da simulação para não ficar acelerado.
-            # Se a simulação avança 'fixed_delta_seconds' por passo, o FPS é 1.0 / fixed_delta_seconds.
-            fps = 1.0 / config.fixed_delta_seconds if config.fixed_delta_seconds else 30.0
-            pygame_video_writer = cv2.VideoWriter(config.pygame_video_path, fourcc, fps, (config.display_width, config.display_height))
-            print(f"Gravador Pygame iniciado. Salvando em: {config.pygame_video_path} a {fps} FPS")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            video_frames_dir = f"temp_frames_{timestamp}"
+            os.makedirs(video_frames_dir, exist_ok=True)
+            print(f"Frames temporários salvos em: {video_frames_dir}/")
 
         previous_location = observation["location"]
         steps = 0
         done = False
         
+        # Registrar timestamps de simulação para calcular FPS correto no final
+        first_sim_timestamp_ms = None
+        last_sim_timestamp_ms = None
+        
         # Rastrear trajetória para o mapa no final
         trajectory = [(previous_location.x, previous_location.y)]
-        
         
         distance_traveled = 0.0
         start_time = datetime.now()
@@ -508,28 +510,14 @@ def main():
             action, _ = model.predict(state, deterministic=True)
             action = np.asarray(action, dtype=np.float32).flatten()
             # O clip deve corresponder ao novo espaço de ação: [throttle_brake, steer]
-            action = np.clip(action, [-1.0, -1.0], [0.6, 1.0])
-
-            # Forçar uma aceleração mínima na saída do repouso, caso o modelo queira frear ou ficar parado.
-            # if observation.get("speed", 0.0) < config.min_speed_threshold and action[0] <= 0:
-            #     # Força uma pequena ação positiva para garantir o throttle mínimo de 0.2
-            #     action[0] = 0.1
-            #     print(f"[EVAL] Low speed fallback applied: action[0] set to {action[0]:.3f}")
+            action = np.clip(action, [-1.0, -1.0], [0.5, 1.0])
 
             print(f"[EVAL] step={steps} speed={observation.get('speed',0.0):.3f} action={action}")
-            # Este objeto de controle é para logging. Ele deve simular a lógica de _apply_action.
-            control = carla.VehicleControl()
-            action_throttle_brake = float(action[0])
-            control.steer = float(action[1])
-            if action_throttle_brake > 0:
-                control.throttle = action_throttle_brake
-                control.brake = 0.0
-            else:
-                control.throttle = 0.0
-                control.brake = abs(action_throttle_brake)
 
             # Avançar um passo na simulação e obter novos dados
             observation, _, done, info = env.step(action)
+            # Obter o controle REAL que foi aplicado pelo ambiente (usa a mesma lógica do treino)
+            control = vehicle.get_control()
             current_location = observation["location"]
             
             # Atualizar distância percorrida a partir do 'info' do ambiente
@@ -539,16 +527,18 @@ def main():
             # Salvar ponto da trajetória
             trajectory.append((current_location.x, current_location.y))
             
-            # A variável 'done' do env.step() já indica o fim do episódio
-            # (offroad, colisão, ou distância atingida)
-            
             # Calcular speed em km/h
             speed = observation["speed"]
             speed_kmh = speed * 3.6
             
-            # Logar dados do passo
+            # Registrar timestamp da simulação
             snapshot = world.get_snapshot()
             sim_time_ms = snapshot.timestamp.elapsed_seconds * 1000
+            if first_sim_timestamp_ms is None:
+                first_sim_timestamp_ms = sim_time_ms
+            last_sim_timestamp_ms = sim_time_ms
+            
+            # Logar dados do passo
             if evaluation_logger:
                 evaluation_logger.log_step(
                     sim_time_ms,
@@ -573,17 +563,18 @@ def main():
             hud.render(display)
             
             # FPS
-            fps = clock.get_fps()
-            fps_text = pygame.font.Font(None, 16).render(f"FPS: {fps:.1f}", True, (0, 255, 0))
+            current_fps = clock.get_fps()
+            fps_text = pygame.font.Font(None, 16).render(f"FPS: {current_fps:.1f}", True, (0, 255, 0))
             display.blit(fps_text, (10, config.display_height - 20))
             
-            # Gravar frame do Pygame
-            if pygame_video_writer:
-                # Captura o frame do display do pygame
+            # Salvar frame como imagem PNG (sem compressão para ser rápido)
+            if video_frames_dir:
                 frame = pygame.surfarray.array3d(display)
-                # Converte de (width, height, RGB) para (height, width, RGB) e depois para BGR
-                frame = cv2.cvtColor(frame.swapaxes(0, 1), cv2.COLOR_RGB2BGR)
-                pygame_video_writer.write(frame)
+                # Converte de (width, height, RGB) para (height, width, BGR)
+                frame_bgr = cv2.cvtColor(frame.swapaxes(0, 1), cv2.COLOR_RGB2BGR)
+                frame_path = os.path.join(video_frames_dir, f"frame_{frame_count:08d}.png")
+                cv2.imwrite(frame_path, frame_bgr)
+                frame_count += 1
                 
             pygame.display.flip()
             clock.tick(60)
@@ -600,6 +591,36 @@ def main():
         print(f"Steps: {steps}")
         print(f"Distância: {distance_traveled:.2f}m")
         print(f"Sucesso: {'SIM' if distance_traveled >= config.success_distance else 'NÃO'}")
+        
+        # Gerar vídeo final com FPS baseado nos timestamps reais da simulação
+        if config.record_pygame and video_frames_dir and frame_count > 0 and first_sim_timestamp_ms is not None:
+            total_sim_duration_s = (last_sim_timestamp_ms - first_sim_timestamp_ms) / 1000.0
+            if total_sim_duration_s > 0:
+                actual_fps = frame_count / total_sim_duration_s
+            else:
+                actual_fps = 30.0  # fallback
+            
+            print(f"\nGerando vídeo: {frame_count} frames, {total_sim_duration_s:.2f}s de simulação, {actual_fps:.2f} FPS")
+            
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_writer = cv2.VideoWriter(
+                config.pygame_video_path, 
+                fourcc, 
+                actual_fps, 
+                (config.display_width, config.display_height)
+            )
+            
+            for i in range(frame_count):
+                frame_path = os.path.join(video_frames_dir, f"frame_{i:08d}.png")
+                if os.path.exists(frame_path):
+                    frame = cv2.imread(frame_path)
+                    if frame is not None:
+                        video_writer.write(frame)
+                if (i + 1) % 500 == 0:
+                    print(f"  Processando frame {i+1}/{frame_count}...")
+            
+            video_writer.release()
+            print(f"Vídeo salvo em: {config.pygame_video_path} ({actual_fps:.2f} FPS)")
         
         # Gerar imagens de resumo final do trajeto
         generate_map_images(world, trajectory, draw_waypoints=config.draw_waypoints)
@@ -619,14 +640,10 @@ def main():
     
     finally:
         # Limpeza
-        # Limpeza e SALVAR GRAVAÇÕES
         try:
             if evaluation_logger:
                 evaluation_logger.close()
 
-            if pygame_video_writer:
-                pygame_video_writer.release()
-                print(f"Vídeo Pygame salvo em: {config.pygame_video_path}")
             if carla_recorder_started:
                 if client: client.stop_recorder()
                 print(f"Gravação CARLA salva em: {config.carla_rec_path}")
@@ -634,6 +651,16 @@ def main():
                 env.shutdown() # Isso já cuida de destruir veículo, sensores e câmeras
         except Exception as e:
             print(f"Erro durante limpeza: {e}")
+        
+        # Limpar diretório temporário de frames
+        if video_frames_dir and os.path.exists(video_frames_dir):
+            try:
+                for f in os.listdir(video_frames_dir):
+                    os.remove(os.path.join(video_frames_dir, f))
+                os.rmdir(video_frames_dir)
+                print(f"Diretório temporário removido: {video_frames_dir}")
+            except Exception as e:
+                print(f"Erro ao limpar diretório temporário: {e}")
         
         pygame.quit()
 
